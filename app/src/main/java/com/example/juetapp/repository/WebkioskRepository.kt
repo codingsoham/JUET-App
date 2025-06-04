@@ -51,7 +51,7 @@ class WebkioskRepository(
     }
 
     // Academic Information Methods
-    suspend fun getAttendance(): Result<List<AttendanceRecord>> {
+    suspend fun getAttendance(credentials: UserCredentials?): Result<List<AttendanceRecord>> {
         return scraper.getAttendance()
     }
 
@@ -81,9 +81,9 @@ class WebkioskRepository(
     }
 
     // Convenience method to fetch all academic data at once
-    suspend fun getAllAcademicData(): AcademicDataResult {
+    suspend fun getAllAcademicData(credentials: UserCredentials): AcademicDataResult {
         return AcademicDataResult(
-            attendance = getAttendance(),
+            attendance = getAttendance(credentials),
             subjects = getRegisteredSubjects(),
             faculty = getSubjectFaculty(),
             disciplinaryActions = getDisciplinaryActions()

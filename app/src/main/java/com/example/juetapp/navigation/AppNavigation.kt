@@ -11,7 +11,10 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.example.juetapp.repository.WebkioskRepository
+import com.example.juetapp.ui.AttendanceScreen
 import com.example.juetapp.ui.LoginScreen
+import com.example.juetapp.viewmodel.AttendanceViewModel
+import com.example.juetapp.viewmodel.AttendanceViewModelFactory
 import com.example.juetapp.viewmodel.LoginViewModel
 import com.example.juetapp.viewmodel.LoginViewModelFactory
 
@@ -22,10 +25,7 @@ fun AppNavigation() {
     val navController = rememberNavController()
     val context = LocalContext.current
 
-    // Create a simple WebkioskScraper implementation for now
     val scraper = remember { WebkioskScraper() }
-
-    // Create repository with required parameters
     val webkioskRepository = remember {
         WebkioskRepository(scraper, context.dataStore)
     }
@@ -37,14 +37,24 @@ fun AppNavigation() {
         composable("login") {
             LoginScreen(
                 viewModel = loginViewModel,
-                onLoginSuccess = { navController.navigate("home") }
+                // Navigate directly to attendance screen after login
+                onLoginSuccess = { navController.navigate("attendance") {
+                    // Clear the back stack so user can't go back to login
+                    popUpTo("login") { inclusive = true }
+                }}
             )
         }
         composable("home") {
             // HomeScreen implementation will be added later
         }
         composable("attendance") {
-            // AttendanceScreen implementation will be added later
+            val attendanceViewModelFactory = remember { AttendanceViewModelFactory(webkioskRepository) }
+            val attendanceViewModel: AttendanceViewModel = viewModel(factory = attendanceViewModelFactory)
+
+            AttendanceScreen(
+                viewModel = attendanceViewModel,
+                onBackClick = { navController.navigateUp() }
+            )
         }
         composable("marks") {
             // MarksScreen implementation will be added later

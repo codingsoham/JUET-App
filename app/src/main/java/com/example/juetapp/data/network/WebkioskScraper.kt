@@ -138,10 +138,36 @@ class WebkioskScraper {
         }
     }
 
+    // In WebkioskScraper.kt
+// Add this method to refresh login session if needed
+    suspend fun ensureActiveSession(credentials: UserCredentials): Boolean {
+        val testRequest = Request.Builder()
+            .url("${studentFilesUrl}Academic/StudentAttendanceList.jsp")
+            .build()
+
+        val response = client.newCall(testRequest).execute()
+        val html = response.body?.string() ?: ""
+
+        return if (html.contains("Session Timeout")) {
+            // Session expired, login again
+            val result = login(credentials)
+            result.isSuccess && result.getOrDefault(false)
+        } else {
+            true // Session is still valid
+        }
+    }
+
     // Academic Info Methods
-    suspend fun getAttendance(): Result<List<AttendanceRecord>> {
+    suspend fun getAttendance(credentials: UserCredentials? = null): Result<List<AttendanceRecord>> {
         return withContext(Dispatchers.IO) {
             try {
+                // If credentials provided, ensure active session first
+                if (credentials != null) {
+                    val sessionActive = ensureActiveSession(credentials)
+                    if (!sessionActive) {
+                        return@withContext Result.failure(Exception("Could not establish session"))
+                    }
+                }
                 val request = Request.Builder()
                     .url("${studentFilesUrl}Academic/StudentAttendanceList.jsp")
                     .build()
@@ -298,30 +324,71 @@ class WebkioskScraper {
         val document = Jsoup.parse(html)
         val attendanceList = mutableListOf<AttendanceRecord>()
 
-        // Look for table with attendance data
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row -> // Skip header row
-                val cells = row.select("td")
-                if (cells.size >= 4) {
-                    try {
-                        val subject = cells[0].text().trim()
-                        val totalClasses = cells[1].text().trim().toIntOrNull() ?: 0
-                        val attendedClasses = cells[2].text().trim().toIntOrNull() ?: 0
-                        val percentage = cells[3].text().replace("%", "").trim().toFloatOrNull() ?: 0f
+        // Find the main attendance table with class "sort-table"
+        val attendanceTable = document.selectFirst("table.sort-table")
+            ?: document.selectFirst("table#table-1")
+            ?: return attendanceList
 
-                        if (subject.isNotEmpty()) {
-                            attendanceList.add(
-                                AttendanceRecord(subject, totalClasses, attendedClasses, percentage)
-                            )
+        // Skip header row and parse data rows
+        attendanceTable.select("tbody tr").forEach { row ->
+            val cells = row.select("td")
+            if (cells.size >= 6) {
+                try {
+                    val sno = cells[0].text().trim()
+                    val subject = cells[1].text().trim()
+
+                    // Extract percentages from different columns
+                    val lectureTutorialPercent = extractPercentageFromCell(cells[2])
+                    val lecturePercent = extractPercentageFromCell(cells[3])
+                    val tutorialPercent = extractPercentageFromCell(cells[4])
+                    val practicalPercent = extractPercentageFromCell(cells[5])
+
+                    if (subject.isNotEmpty() && sno.isNotEmpty()) {
+                        // Create attendance record with the best available percentage
+                        val overallPercentage = when {
+                            lectureTutorialPercent > 0 -> lectureTutorialPercent
+                            lecturePercent > 0 -> lecturePercent
+                            practicalPercent > 0 -> practicalPercent
+                            tutorialPercent > 0 -> tutorialPercent
+                            else -> 0f
                         }
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing attendance row: ${e.message}")
+
+                        attendanceList.add(
+                            AttendanceRecord(
+                                subject = subject,
+                                totalClasses = 0, // Not provided in this format
+                                attendedClasses = 0, // Not provided in this format
+                                percentage = overallPercentage,
+                                lecturePercent = if (lecturePercent > 0) lecturePercent else null,
+                                tutorialPercent = if (tutorialPercent > 0) tutorialPercent else null,
+                                practicalPercent = if (practicalPercent > 0) practicalPercent else null,
+                                lectureTutorialPercent = if (lectureTutorialPercent > 0) lectureTutorialPercent else null
+                            )
+                        )
                     }
+                } catch (e: Exception) {
+                    Log.w("WebkioskScraper", "Error parsing attendance row: ${e.message}")
                 }
             }
         }
 
         return attendanceList
+    }
+
+    private fun extractPercentageFromCell(cell: org.jsoup.nodes.Element): Float {
+        // Extract percentage from link text or cell text
+        val linkElement = cell.selectFirst("a")
+        val text = if (linkElement != null) {
+            linkElement.text().trim()
+        } else {
+            cell.text().trim()
+        }
+
+        return if (text.isNotEmpty() && text != "&nbsp;" && text != " ") {
+            text.replace("%", "").toFloatOrNull() ?: 0f
+        } else {
+            0f
+        }
     }
 
     private fun parseSubjectData(html: String): List<SubjectInfo> {
