@@ -15,6 +15,10 @@ class LoginViewModel(
     private val _uiState = mutableStateOf(LoginUiState())
     val uiState: State<LoginUiState> = _uiState
 
+    // This can be observed by the navigation to trigger attendance loading
+    private val _loginSuccess = mutableStateOf(false)
+    val loginSuccess: State<Boolean> = _loginSuccess
+
     init {
         loadStoredCredentials()
     }
@@ -34,6 +38,7 @@ class LoginViewModel(
     fun login() {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
+            _loginSuccess.value = false
 
             val credentials = UserCredentials(
                 enrollmentNo = _uiState.value.enrollmentNo,
@@ -48,6 +53,10 @@ class LoginViewModel(
                         isLoggedIn = success,
                         errorMessage = if (!success) "Invalid credentials" else null
                     )
+
+                    if (success) {
+                        _loginSuccess.value = true
+                    }
                 },
                 onFailure = { error ->
                     _uiState.value = _uiState.value.copy(
