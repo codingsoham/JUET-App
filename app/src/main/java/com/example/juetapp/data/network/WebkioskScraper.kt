@@ -1,8 +1,8 @@
 import android.util.Log
 import com.example.juetapp.data.userData.AttendanceRecord
-import com.example.juetapp.data.userData.MarksRecord
 import com.example.juetapp.data.userData.UserCredentials
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -12,564 +12,636 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.logging.HttpLoggingInterceptor
 import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
-import java.util.Calendar
 import java.util.concurrent.TimeUnit
 
-// Data classes for different sections
-data class SubjectInfo(
-    val subjectCode: String,
-    val subjectName: String,
-    val credits: Int,
-    val semester: String
-)
-
-data class SubjectFaculty(
-    val subjectCode: String,
-    val subjectName: String,
-    val facultyName: String,
-    val semester: String
-)
-
-data class DisciplinaryAction(
-    val date: String,
-    val action: String,
-    val reason: String,
-    val status: String
-)
-
-data class SeatingPlan(
-    val examDate: String,
-    val examTime: String,
-    val subject: String,
-    val roomNo: String,
-    val seatNo: String
-)
-
-data class CGPARecord(
-    val semester: String,
-    val sgpa: Float,
-    val cgpa: Float,
-    val totalCredits: Int
-)
-
 class WebkioskScraper {
-    // Use a proper cookie jar implementation
+    private val baseUrl = "https://webkiosk.juet.ac.in"
+    private val loginUrl = "$baseUrl/index.jsp"
+    private val studentFilesUrl = "$baseUrl/StudentFiles"
+
+    // Improved cookie jar with better domain handling
     private val cookieJar = object : CookieJar {
-        private val cookieStore = HashMap<String, List<Cookie>>()
+        private val cookieStore = HashMap<String, MutableList<Cookie>>()
 
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-            cookieStore[url.host] = cookies
-            Log.d("WebkioskScraper", "Saved cookies: $cookies")
+            if (cookies.isNotEmpty()) {
+                Log.d("WebkioskScraper", "Saving cookies for ${url.host}: ${cookies.size} cookies")
+
+                // Store cookies for the exact host
+                val hostKey = url.host
+                cookieStore[hostKey] = cookies.toMutableList()
+
+                // Log important cookies
+                cookies.forEach { cookie ->
+                    Log.d("WebkioskScraper", "Cookie: ${cookie.name}=${cookie.value}, Domain: ${cookie.domain}, Path: ${cookie.path}")
+                    if (cookie.name == "JSESSIONID") {
+                        Log.d("WebkioskScraper", "JSESSIONID saved: ${cookie.value}")
+                    }
+                }
+            }
         }
 
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
-            val cookies = cookieStore[url.host] ?: emptyList()
-            Log.d("WebkioskScraper", "Loading cookies for ${url.host}: $cookies")
-            return cookies
+            val hostKey = url.host
+            val cookies = cookieStore[hostKey] ?: mutableListOf()
+
+            // Filter cookies that are valid for this request
+            val validCookies = cookies.filter { cookie ->
+                // Check if cookie domain matches
+                val cookieDomain = cookie.domain
+                val hostMatches = when {
+                    cookieDomain.startsWith(".") -> url.host.endsWith(cookieDomain.substring(1))
+                    else -> url.host == cookieDomain || url.host.endsWith(".$cookieDomain")
+                }
+
+                // Check if cookie path matches
+                val pathMatches = url.encodedPath.startsWith(cookie.path)
+
+                // Check if cookie is not expired
+                val notExpired = cookie.expiresAt > System.currentTimeMillis()
+
+                hostMatches && pathMatches && (cookie.persistent || notExpired)
+            }
+
+            Log.d("WebkioskScraper", "Loading ${validCookies.size} valid cookies for ${url.host}${url.encodedPath}")
+            validCookies.forEach { cookie ->
+                if (cookie.name == "JSESSIONID") {
+                    Log.d("WebkioskScraper", "JSESSIONID loaded: ${cookie.value}")
+                }
+            }
+
+            return validCookies
+        }
+
+        private fun extractBaseDomain(host: String): String {
+            val parts = host.split('.')
+            return if (parts.size >= 2) {
+                parts.takeLast(2).joinToString(".")
+            } else host
+        }
+
+        fun hasSessionCookie(): Boolean {
+            return cookieStore.values.flatten().any {
+                it.name == "JSESSIONID" && it.value.isNotBlank() &&
+                        it.expiresAt > System.currentTimeMillis()
+            }
+        }
+
+        fun clearCookies() {
+            cookieStore.clear()
+            Log.d("WebkioskScraper", "All cookies cleared")
         }
     }
 
+    // HTTP client with better configuration
     private val client = OkHttpClient.Builder()
         .cookieJar(cookieJar)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            val original = chain.request()
+            val request = original.newBuilder()
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Accept-Encoding", "gzip, deflate, br")
+                .header("Connection", "keep-alive")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "same-origin")
+                .build()
+            chain.proceed(request)
+        }
         .addInterceptor(HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
+            level = HttpLoggingInterceptor.Level.HEADERS // Reduced logging to avoid clutter
         })
         .build()
 
-    private val baseUrl = "https://webkiosk.juet.ac.in/"
-    private val studentFilesUrl = "https://webkiosk.juet.ac.in/StudentFiles/"
-
+    // Improved login method with better error handling
     suspend fun login(credentials: UserCredentials): Result<Boolean> {
         return withContext(Dispatchers.IO) {
             try {
-                // First visit the homepage to get initial cookies
+                Log.d("WebkioskScraper", "=== Starting Login Process ===")
+
+                // Clear any existing cookies first
+                cookieJar.clearCookies()
+
+                // Step 1: Get initial page to establish session
+                Log.d("WebkioskScraper", "Step 1: Getting initial login page")
                 val initialRequest = Request.Builder()
-                    .url(baseUrl)
+                    .url(loginUrl)
+                    .get()
                     .build()
 
+                Log.d("WebkioskScraper", "Executing initial request to ${initialRequest.url}")
+                Log.d("WebkioskScraper", "Initial request headers: ${initialRequest}")
                 val initialResponse = client.newCall(initialRequest).execute()
-                val loginPageHtml = initialResponse.body?.string() ?: ""
-                val document = Jsoup.parse(loginPageHtml)
+                val initialHtml = initialResponse.body?.string() ?: ""
+                Log.d("WebkioskScraper", "Initial response: ${initialHtml}")
+                Log.d("WebkioskScraper", "Initial response code: ${initialResponse.code}")
+                Log.d("WebkioskScraper", "Initial response length: ${initialHtml.length}")
 
-                // Extract captcha
-                val captcha = extractCaptcha(document)
-                Log.d("WebkioskScraper", "Extracted Captcha: $captcha")
+                if (initialResponse.code != 200) {
+                    return@withContext Result.failure(Exception("Failed to load login page: ${initialResponse.code}"))
+                }
 
-                // Submit login form
-                val formData = FormBody.Builder()
-                    .add("InstCode", "JUET")
-                    .add("UserType", "S") // Default to Student type
+                // Step 2: Extract captcha
+                Log.d("WebkioskScraper", "Step 2: Extracting captcha")
+                val captcha = extractCaptcha(initialHtml)
+                if (captcha == null) {
+                    Log.e("WebkioskScraper", "Failed to extract captcha from HTML")
+                    return@withContext Result.failure(Exception("Failed to extract captcha"))
+                }
+
+                Log.d("WebkioskScraper", "Extracted captcha: '$captcha'")
+
+                // Step 3: Submit login form
+                Log.d("WebkioskScraper", "Step 3: Submitting login form")
+                val formBody = FormBody.Builder()
+                    .add("InstCode", "JUET")  // Note: case-sensitive
+                    .add("UserType", credentials.userType)
                     .add("MemberCode", credentials.enrollmentNo)
                     .add("DATE1", credentials.dateOfBirth)
                     .add("Password", credentials.password)
                     .add("txtcap", captcha)
                     .add("BTNSubmit", "Submit")
+                    .add("x", "")  // Add the hidden field with empty value
                     .build()
 
-                // Submit to the correct login endpoint
-                val loginResponse = client.newCall(
-                    Request.Builder()
-                        .url("${baseUrl}StudentFiles/StudentPage.jsp")
-                        .post(formData)
-                        .build()
-                ).execute()
+// Use the correct form action URL from the HTML
+                val loginUrl = "$baseUrl/CommonFiles/UserAction.jsp"
 
-                // Check if redirected to student page
-                val responseUrl = loginResponse.request.url.toString()
+                val loginRequest = Request.Builder()
+                    .url(loginUrl)  // Correct endpoint
+                    .post(formBody)
+                    .header("Referer", baseUrl)
+                    .header("Origin", baseUrl)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .build()
+
+                Log.d("WebkioskScraper", "Executing login request to ${loginRequest.url}")
+                Log.d("WebkioskScraper", "Login request body: ${loginRequest}")
+                val loginResponse = client.newCall(loginRequest).execute()
                 val responseBody = loginResponse.body?.string() ?: ""
+                Log.d("WebkioskScraper", "Login response body: $responseBody")
+                Log.d("WebkioskScraper", "Login response code: ${loginResponse.code}")
+                Log.d("WebkioskScraper", "Login response URL: ${loginResponse.request.url}")
+                Log.d("WebkioskScraper", "Response body length: ${responseBody.length}")
 
-                val isLoginSuccessful = !responseBody.contains("Invalid") &&
-                        !responseBody.contains("Error") &&
-                        !responseBody.contains("Session timeout") &&
-                        (responseUrl.contains("StudentPage") || responseUrl.contains("DashBoard"))
+                // Step 4: Check login success
+                val loginSuccess = checkLoginSuccess(responseBody, loginResponse)
 
-                Log.d("WebkioskScraper", "Login response URL: $responseUrl")
-                Log.d("WebkioskScraper", "Login successful: $isLoginSuccessful")
+                if (loginSuccess) {
+                    Log.d("WebkioskScraper", "=== Login Successful ===")
+                    return@withContext Result.success(true)
+                } else {
+                    Log.e("WebkioskScraper", "=== Login Failed ===")
+                    return@withContext Result.success(false)
+                }
 
-                Result.success(isLoginSuccessful)
             } catch (e: Exception) {
                 Log.e("WebkioskScraper", "Login error", e)
-                Result.failure(e)
+                return@withContext Result.failure(e)
             }
         }
     }
 
-    // In WebkioskScraper.kt
-// Add this method to refresh login session if needed
-    suspend fun ensureActiveSession(credentials: UserCredentials): Boolean {
-        val testRequest = Request.Builder()
-            .url("${studentFilesUrl}Academic/StudentAttendanceList.jsp")
-            .build()
+    // Updated login success check that handles the empty response with verification
+    private fun checkLoginSuccess(responseBody: String, loginResponse: okhttp3.Response): Boolean {
+        Log.d("WebkioskScraper", "=== Checking Login Success ===")
+        Log.d("WebkioskScraper", "Response body content: '${responseBody}'")
 
-        val response = client.newCall(testRequest).execute()
-        val html = response.body?.string() ?: ""
+        // Check 1: HTTP status
+        val statusOk = loginResponse.code == 200
+        Log.d("WebkioskScraper", "Status OK: $statusOk (${loginResponse.code})")
 
-        return if (html.contains("Session Timeout")) {
-            // Session expired, login again
-            val result = login(credentials)
-            result.isSuccess && result.getOrDefault(false)
-        } else {
-            true // Session is still valid
+        // Check 2: Has session cookie
+        val hasSessionCookie = cookieJar.hasSessionCookie()
+        Log.d("WebkioskScraper", "Has session cookie: $hasSessionCookie")
+
+        // Check 3: URL indicates success
+        val correctUrl = loginResponse.request.url.toString().contains("StudentPage.jsp")
+        Log.d("WebkioskScraper", "Correct URL: $correctUrl")
+
+        // Empty response is normal for this system, so we should check if we need to verify
+        val isEmpty = responseBody.trim().isEmpty() || responseBody.length <= 10
+        Log.d("WebkioskScraper", "Response is empty or minimal: $isEmpty")
+
+        // If we have an empty response but all other indicators are good, perform verification
+        if (statusOk && hasSessionCookie && correctUrl && isEmpty) {
+            Log.d("WebkioskScraper", "Empty response but good indicators - performing verification")
+            return verifyLoginSuccess()
+        }
+
+        // For non-empty responses, check for traditional indicators
+        val noErrorIndicators = !responseBody.contains("Invalid", ignoreCase = true) &&
+                !responseBody.contains("Error", ignoreCase = true) &&
+                !responseBody.contains("incorrect", ignoreCase = true) &&
+                !responseBody.contains("failed", ignoreCase = true)
+
+        val hasFrameset = responseBody.contains("<frameset", ignoreCase = true)
+
+        Log.d("WebkioskScraper", "No error indicators: $noErrorIndicators")
+        Log.d("WebkioskScraper", "Has frameset: $hasFrameset")
+
+        val isSuccess = statusOk && hasSessionCookie && correctUrl &&
+                (isEmpty || (noErrorIndicators && hasFrameset))
+
+        Log.d("WebkioskScraper", "Overall success: $isSuccess")
+
+        return isSuccess
+    }
+
+    // Add this method to verify login success by making a follow-up request
+    private fun verifyLoginSuccess(): Boolean {
+        try {
+            // Attempt to access the frameset page to verify login
+            val verificationRequest = Request.Builder()
+                .url("$studentFilesUrl/FrameLeftStudent.jsp")
+                .get()
+                .build()
+
+            val verificationResponse = client.newCall(verificationRequest).execute()
+            val verificationBody = verificationResponse.body?.string() ?: ""
+
+            Log.d("WebkioskScraper", "Verification response code: ${verificationResponse.code}")
+            Log.d("WebkioskScraper", "Verification body length: ${verificationBody.length}")
+
+            // Check for successful indicators in the frameset
+            val isSuccess = verificationResponse.code == 200 &&
+                    verificationBody.length > 100 &&
+                    (verificationBody.contains("Student", ignoreCase = true) ||
+                            verificationBody.contains("JUET", ignoreCase = true))
+
+            Log.d("WebkioskScraper", "Verification success: $isSuccess")
+            return isSuccess
+
+        } catch (e: Exception) {
+            Log.e("WebkioskScraper", "Error during login verification", e)
+            return false
         }
     }
 
-    // Academic Info Methods
-    suspend fun getAttendance(credentials: UserCredentials? = null): Result<List<AttendanceRecord>> {
-        return withContext(Dispatchers.IO) {
-            try {
-                // If credentials provided, ensure active session first
-                if (credentials != null) {
-                    val sessionActive = ensureActiveSession(credentials)
-                    if (!sessionActive) {
-                        return@withContext Result.failure(Exception("Could not establish session"))
+    // Improved captcha extraction
+    private fun extractCaptcha(html: String): String? {
+        try {
+            val doc = Jsoup.parse(html)
+
+            // Method 1: Try the previously working approach with .noselect class
+            val captchaElement = doc.selectFirst(".noselect")
+            val noSelectText = captchaElement?.text()?.replace(Regex("[^A-Za-z0-9]"), "")
+            if (!noSelectText.isNullOrBlank() && noSelectText.length in 4..6) {
+                Log.d("WebkioskScraper", "Found captcha using .noselect: '$noSelectText'")
+                return noSelectText
+            }
+
+            // Method 2: Look for specific table cell that contains captcha (common in Webkiosk)
+            val captchaCells = doc.select("table td:contains(Enter Captcha):not(:contains(Jaypee))")
+            val nextCell = captchaCells.firstOrNull()?.nextElementSibling()
+            val cellText = nextCell?.text()?.replace(Regex("[^A-Za-z0-9]"), "")
+            if (!cellText.isNullOrBlank() && cellText.length in 4..6) {
+                Log.d("WebkioskScraper", "Found captcha in table cell: '$cellText'")
+                return cellText
+            }
+
+            // Method 3: Look for a short text that's likely a captcha (not "Jaypee")
+            val potentialCaptchas = doc.select("font[face=Arial][color=blue], .loginCaptcha, #captcha, #cap")
+            for (element in potentialCaptchas) {
+                val text = element.text().replace(Regex("[^A-Za-z0-9]"), "")
+                if (text.length in 4..6 && text != "Jaypee") {
+                    Log.d("WebkioskScraper", "Found captcha in element: '$text'")
+                    return text
+                }
+            }
+
+            // Method 4: Search for captcha in image alt text
+            val captchaImages = doc.select("img[src*=captcha], img[alt*=captcha]")
+            for (img in captchaImages) {
+                val altText = img.attr("alt").replace(Regex("[^A-Za-z0-9]"), "")
+                if (altText.length in 4..6) {
+                    Log.d("WebkioskScraper", "Found captcha in image alt: '$altText'")
+                    return altText
+                }
+            }
+
+            // Debug: Log the HTML structure to identify captcha location
+            Log.d("WebkioskScraper", "Could not find captcha, logging HTML structure for debugging")
+            val htmlStructure = doc.select("body > *").joinToString("\n") { it.tagName() + ": " + it.className() }
+            Log.d("WebkioskScraper", "HTML structure: $htmlStructure")
+
+            return null
+        } catch (e: Exception) {
+            Log.e("WebkioskScraper", "Error extracting captcha", e)
+            return null
+        }
+    }
+    
+    // Helper method to extract attendance links from left frame
+    private fun extractAttendanceLinksFromLeftFrame(html: String): List<String> {
+        val links = mutableListOf<String>()
+        try {
+            val doc = Jsoup.parse(html)
+
+            // Look for links containing attendance-related keywords
+            val attendanceKeywords = listOf("attendance", "Attendance", "ATTENDANCE")
+
+            for (keyword in attendanceKeywords) {
+                val elements = doc.select("a[href*=$keyword]")
+                elements.forEach { element ->
+                    val href = element.attr("href")
+                    if (href.isNotBlank()) {
+                        links.add(href)
+                        Log.d("WebkioskScraper", "Found attendance link: $href")
                     }
                 }
-                val request = Request.Builder()
-                    .url("${studentFilesUrl}Academic/StudentAttendanceList.jsp")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                val html = response.body?.string() ?: ""
-
-                Log.d("WebkioskScraper", "Attendance HTML response: ${html.take(500)}")
-
-                val attendanceList = parseAttendanceData(html)
-                Result.success(attendanceList)
-            } catch (e: Exception) {
-                Log.e("WebkioskScraper", "Attendance fetch error", e)
-                Result.failure(e)
             }
+
+            // Also look for any links in Academic section
+            val academicLinks = doc.select("a[href*=Academic]")
+            academicLinks.forEach { element ->
+                val href = element.attr("href")
+                if (href.isNotBlank()) {
+                    links.add(href)
+                    Log.d("WebkioskScraper", "Found academic link: $href")
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e("WebkioskScraper", "Error extracting links from left frame", e)
         }
+        return links
     }
 
-    suspend fun getRegisteredSubjects(): Result<List<SubjectInfo>> {
+    // Improved session validation that checks for frameset response
+    private suspend fun hasValidSession(): Boolean {
         return withContext(Dispatchers.IO) {
             try {
+                // Check 1: Session cookie exists
+                if (!cookieJar.hasSessionCookie()) {
+                    Log.d("WebkioskScraper", "No session cookie found")
+                    return@withContext false
+                }
+
+                // Check 2: Test with StudentPage.jsp
+                val testUrl = "$studentFilesUrl/StudentPage.jsp"
                 val request = Request.Builder()
-                    .url("${studentFilesUrl}Academic/StudSubjectTaken.jsp")
+                    .url(testUrl)
+                    .get()
+                    .header("Cache-Control", "no-cache")
+                    .header("Referer", loginUrl)
                     .build()
 
                 val response = client.newCall(request).execute()
                 val html = response.body?.string() ?: ""
 
-                Log.d("WebkioskScraper", "Subject Registration HTML: ${html.take(500)}")
+                Log.d("WebkioskScraper", "Session validation response: ${response.code}")
+                Log.d("WebkioskScraper", "Response length: ${html.length}")
 
-                val subjectList = parseSubjectData(html)
-                Result.success(subjectList)
+                // Check for session timeout indicators
+                val sessionTimeoutIndicators = listOf(
+                    "session timeout",
+                    "session expired",
+                    "please login",
+                    "login again",
+                    "invalid session"
+                )
+
+                val hasTimeoutIndicator = sessionTimeoutIndicators.any {
+                    html.contains(it, ignoreCase = true)
+                }
+
+                // Check if redirected to login page
+                val redirectedToLogin = response.request.url.toString().contains("index.jsp")
+
+                // Check for successful frameset response
+                val hasValidFrameset = html.contains("<frameset", ignoreCase = true) ||
+                        html.contains("FrameLeftStudent.jsp", ignoreCase = true) ||
+                        html.contains("JUET", ignoreCase = true)
+
+                val isValid = response.code == 200 &&
+                        !hasTimeoutIndicator &&
+                        !redirectedToLogin &&
+                        hasValidFrameset
+
+                Log.d("WebkioskScraper", "Session validation result: $isValid")
+                Log.d("WebkioskScraper", "- Status OK: ${response.code == 200}")
+                Log.d("WebkioskScraper", "- No timeout indicators: ${!hasTimeoutIndicator}")
+                Log.d("WebkioskScraper", "- Not redirected to login: ${!redirectedToLogin}")
+                Log.d("WebkioskScraper", "- Has valid frameset: $hasValidFrameset")
+
+                return@withContext isValid
+
             } catch (e: Exception) {
-                Log.e("WebkioskScraper", "Subject registration fetch error", e)
-                Result.failure(e)
+                Log.e("WebkioskScraper", "Error validating session", e)
+                return@withContext false
             }
         }
     }
 
-    suspend fun getSubjectFaculty(): Result<List<SubjectFaculty>> {
+    // Updated attendance fetching method that handles frameset structure
+    suspend fun getAttendanceFromFrameset(credentials: UserCredentials): Result<List<AttendanceRecord>> {
         return withContext(Dispatchers.IO) {
             try {
-                val request = Request.Builder()
-                    .url("${studentFilesUrl}Academic/StudSubjectFaculty.jsp")
-                    .build()
+                Log.d("WebkioskScraper", "=== Getting Attendance from Frameset ===")
 
-                val response = client.newCall(request).execute()
-                val html = response.body?.string() ?: ""
+                // Step 1: Ensure we have a valid session
+                var hasValidSession = hasValidSession()
+                Log.d("WebkioskScraper", "Initial session check: $hasValidSession")
 
-                Log.d("WebkioskScraper", "Subject Faculty HTML: ${html.take(500)}")
+                if (!hasValidSession) {
+                    Log.d("WebkioskScraper", "No valid session, attempting login")
+                    val loginResult = login(credentials)
 
-                val facultyList = parseSubjectFacultyData(html)
-                Result.success(facultyList)
-            } catch (e: Exception) {
-                Log.e("WebkioskScraper", "Subject faculty fetch error", e)
-                Result.failure(e)
-            }
-        }
-    }
-
-    suspend fun getDisciplinaryActions(): Result<List<DisciplinaryAction>> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val request = Request.Builder()
-                    .url("${studentFilesUrl}Academic/DisciplinaryAction.jsp")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                val html = response.body?.string() ?: ""
-
-                Log.d("WebkioskScraper", "Disciplinary Action HTML: ${html.take(500)}")
-
-                val actionList = parseDisciplinaryActionData(html)
-                Result.success(actionList)
-            } catch (e: Exception) {
-                Log.e("WebkioskScraper", "Disciplinary action fetch error", e)
-                Result.failure(e)
-            }
-        }
-    }
-
-    // Exam Info Methods
-    suspend fun getSeatingPlan(): Result<List<SeatingPlan>> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val request = Request.Builder()
-                    .url("${studentFilesUrl}Exam/StudViewSeatPlan.jsp")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                val html = response.body?.string() ?: ""
-
-                Log.d("WebkioskScraper", "Seating Plan HTML: ${html.take(500)}")
-
-                val seatingPlanList = parseSeatingPlanData(html)
-                Result.success(seatingPlanList)
-            } catch (e: Exception) {
-                Log.e("WebkioskScraper", "Seating plan fetch error", e)
-                Result.failure(e)
-            }
-        }
-    }
-
-    suspend fun getExamMarks(): Result<List<MarksRecord>> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val request = Request.Builder()
-                    .url("${studentFilesUrl}Exam/StudentEventMarksView.jsp")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                val html = response.body?.string() ?: ""
-
-                Log.d("WebkioskScraper", "Exam Marks HTML: ${html.take(500)}")
-
-                val marksList = parseMarksData(html)
-                Result.success(marksList)
-            } catch (e: Exception) {
-                Log.e("WebkioskScraper", "Exam marks fetch error", e)
-                Result.failure(e)
-            }
-        }
-    }
-
-    suspend fun getCGPAReport(): Result<List<CGPARecord>> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val request = Request.Builder()
-                    .url("${studentFilesUrl}Exam/StudCGPAReport.jsp")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                val html = response.body?.string() ?: ""
-
-                Log.d("WebkioskScraper", "CGPA Report HTML: ${html.take(500)}")
-
-                val cgpaList = parseCGPAData(html)
-                Result.success(cgpaList)
-            } catch (e: Exception) {
-                Log.e("WebkioskScraper", "CGPA report fetch error", e)
-                Result.failure(e)
-            }
-        }
-    }
-
-    // Parsing Methods
-    private fun extractCaptcha(document: Document): String {
-
-        val captchaElement = document.selectFirst(".noselect")
-        return captchaElement?.text()?.replace(Regex("[^A-Za-z0-9]"), "") ?: ""
-    }
-
-    private fun parseAttendanceData(html: String): List<AttendanceRecord> {
-        val document = Jsoup.parse(html)
-        val attendanceList = mutableListOf<AttendanceRecord>()
-
-        // Find the main attendance table with class "sort-table"
-        val attendanceTable = document.selectFirst("table.sort-table")
-            ?: document.selectFirst("table#table-1")
-            ?: return attendanceList
-
-        // Skip header row and parse data rows
-        attendanceTable.select("tbody tr").forEach { row ->
-            val cells = row.select("td")
-            if (cells.size >= 6) {
-                try {
-                    val sno = cells[0].text().trim()
-                    val subject = cells[1].text().trim()
-
-                    // Extract percentages from different columns
-                    val lectureTutorialPercent = extractPercentageFromCell(cells[2])
-                    val lecturePercent = extractPercentageFromCell(cells[3])
-                    val tutorialPercent = extractPercentageFromCell(cells[4])
-                    val practicalPercent = extractPercentageFromCell(cells[5])
-
-                    if (subject.isNotEmpty() && sno.isNotEmpty()) {
-                        // Create attendance record with the best available percentage
-                        val overallPercentage = when {
-                            lectureTutorialPercent > 0 -> lectureTutorialPercent
-                            lecturePercent > 0 -> lecturePercent
-                            practicalPercent > 0 -> practicalPercent
-                            tutorialPercent > 0 -> tutorialPercent
-                            else -> 0f
-                        }
-
-                        attendanceList.add(
-                            AttendanceRecord(
-                                subject = subject,
-                                totalClasses = 0, // Not provided in this format
-                                attendedClasses = 0, // Not provided in this format
-                                percentage = overallPercentage,
-                                lecturePercent = if (lecturePercent > 0) lecturePercent else null,
-                                tutorialPercent = if (tutorialPercent > 0) tutorialPercent else null,
-                                practicalPercent = if (practicalPercent > 0) practicalPercent else null,
-                                lectureTutorialPercent = if (lectureTutorialPercent > 0) lectureTutorialPercent else null
-                            )
-                        )
+                    if (loginResult.isFailure || loginResult.getOrNull() != true) {
+                        return@withContext Result.failure(Exception("Could not establish valid session"))
                     }
+
+                    delay(2000) // Wait after login
+                    hasValidSession = hasValidSession()
+                    Log.d("WebkioskScraper", "Post-login session check: $hasValidSession")
+
+                    if (!hasValidSession) {
+                        return@withContext Result.failure(Exception("Session validation failed after login"))
+                    }
+                }
+
+                // Step 2: Try the direct attendance URL
+                val attendanceUrl = "$studentFilesUrl/Academic/StudentAttendanceList.jsp"
+                Log.d("WebkioskScraper", "Trying attendance URL: $attendanceUrl")
+
+                val request = Request.Builder()
+                    .url(attendanceUrl)
+                    .get()
+                    .header("Referer", "$studentFilesUrl/StudentPage.jsp")
+                    .header("Cache-Control", "no-cache")
+                    .build()
+
+                val response = client.newCall(request).execute()
+                val html = response.body?.string() ?: ""
+
+                Log.d("WebkioskScraper", "Response code: ${response.code}")
+                Log.d("WebkioskScraper", "Response length: ${html.length}")
+                Log.d("WebkioskScraper", "Final URL: ${response.request.url}")
+
+                // Check for session timeout
+                if (html.contains("session timeout", ignoreCase = true) ||
+                    html.contains("please login", ignoreCase = true) ||
+                    response.request.url.toString().contains("index.jsp")) {
+                    Log.e("WebkioskScraper", "Session timeout detected")
+                    return@withContext Result.failure(Exception("Session timeout"))
+                }
+
+                if (response.code == 200 && html.length > 100) {
+                    // Try to parse attendance data
+                    val records = parseAttendanceData(html)
+                    if (records.isNotEmpty()) {
+                        Log.d("WebkioskScraper", "Successfully found ${records.size} attendance records")
+                        return@withContext Result.success(records)
+                    } else {
+                        Log.d("WebkioskScraper", "No attendance records found in response")
+                        // Log first 1000 characters for debugging
+                        Log.d("WebkioskScraper", "Response preview: ${html.take(1000)}")
+                    }
+                }
+
+                return@withContext Result.failure(Exception("Could not find attendance data"))
+
+            } catch (e: Exception) {
+                Log.e("WebkioskScraper", "Failed to load attendance", e)
+                return@withContext Result.failure(e)
+            }
+        }
+    }
+
+    // Fixed parsing function based on actual HTML structure
+    private fun parseAttendanceData(html: String): List<AttendanceRecord> {
+        val records = mutableListOf<AttendanceRecord>()
+
+        try {
+            val doc = Jsoup.parse(html)
+
+            // Look for the specific table with attendance data
+            val table = doc.select("table.sort-table, table[id=table-1]").firstOrNull()
+                ?: doc.select("table").find { it.select("thead tr td").any { td ->
+                    td.text().contains("Subject", ignoreCase = true)
+                }}
+
+            if (table == null) {
+                Log.w("WebkioskScraper", "Could not find attendance table")
+                return records
+            }
+
+            val tbody = table.select("tbody").firstOrNull()
+            val rows = tbody?.select("tr") ?: table.select("tr")
+
+            Log.d("WebkioskScraper", "Found ${rows.size} rows in attendance table")
+
+            for (row in rows) {
+                val columns = row.select("td")
+
+                // Skip header rows and rows with insufficient columns
+                if (columns.size < 6) continue
+
+                // Check if this is a data row (should have a number in first column)
+                val snoText = columns[0].text().trim()
+                if (!snoText.matches(Regex("\\d+"))) continue
+
+                try {
+                    val subject = columns[1].text().trim()
+
+                    // Skip empty subjects
+                    if (subject.isBlank()) continue
+
+                    // Parse attendance percentages based on actual HTML structure
+                    // Column 2: Lecture+Tutorial(%)
+                    // Column 3: Lecture(%)
+                    // Column 4: Tutorial(%)
+                    // Column 5: Practical(%)
+
+                    val lectureTutorialText = columns[2].text().trim()
+                    val lectureText = columns[3].text().trim()
+                    val tutorialText = columns[4].text().trim()
+                    val practicalText = columns[5].text().trim()
+
+                    val lectureTutorialPercent = parsePercentageFromLink(lectureTutorialText)
+                    val lecturePercent = parsePercentageFromLink(lectureText)
+                    val tutorialPercent = parsePercentageFromLink(tutorialText)
+                    val practicalPercent = parsePercentageFromLink(practicalText)
+
+                    // Calculate overall percentage
+                    // If there's a combined Lecture+Tutorial percentage, use that as primary
+                    // Otherwise, average the individual components that exist
+                    val overallPercent = when {
+                        lectureTutorialPercent != null -> lectureTutorialPercent
+                        lecturePercent != null && tutorialPercent != null -> (lecturePercent + tutorialPercent) / 2
+                        lecturePercent != null -> lecturePercent
+                        practicalPercent != null -> practicalPercent
+                        else -> 0f
+                    }
+
+                    val record = AttendanceRecord(
+                        subject = subject,
+                        percentage = overallPercent,
+                        lecturePercent = lecturePercent,
+                        tutorialPercent = tutorialPercent,
+                        practicalPercent = practicalPercent,
+                        lectureTutorialPercent = lectureTutorialPercent
+                    )
+
+                    records.add(record)
+                    Log.d("WebkioskScraper", "Parsed record: $subject - Overall: $overallPercent%")
+
                 } catch (e: Exception) {
                     Log.w("WebkioskScraper", "Error parsing attendance row: ${e.message}")
                 }
             }
+
+        } catch (e: Exception) {
+            Log.e("WebkioskScraper", "Error parsing attendance data", e)
         }
 
-        return attendanceList
+        Log.d("WebkioskScraper", "Total records parsed: ${records.size}")
+        return records
     }
 
-    private fun extractPercentageFromCell(cell: org.jsoup.nodes.Element): Float {
-        // Extract percentage from link text or cell text
-        val linkElement = cell.selectFirst("a")
-        val text = if (linkElement != null) {
-            linkElement.text().trim()
-        } else {
-            cell.text().trim()
-        }
-
-        return if (text.isNotEmpty() && text != "&nbsp;" && text != " ") {
-            text.replace("%", "").toFloatOrNull() ?: 0f
-        } else {
-            0f
-        }
-    }
-
-    private fun parseSubjectData(html: String): List<SubjectInfo> {
-        val document = Jsoup.parse(html)
-        val subjectList = mutableListOf<SubjectInfo>()
-
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row ->
-                val cells = row.select("td")
-                if (cells.size >= 4) {
-                    try {
-                        val subjectCode = cells[0].text().trim()
-                        val subjectName = cells[1].text().trim()
-                        val credits = cells[2].text().trim().toIntOrNull() ?: 0
-                        val semester = cells[3].text().trim()
-
-                        if (subjectCode.isNotEmpty()) {
-                            subjectList.add(
-                                SubjectInfo(subjectCode, subjectName, credits, semester)
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing subject row: ${e.message}")
-                    }
-                }
+    // Enhanced percentage parsing that handles links and various formats
+    private fun parsePercentageFromLink(text: String): Float? {
+        return try {
+            if (text.isBlank() || text.equals("&nbsp;", ignoreCase = true) ||
+                text.equals("NA", ignoreCase = true) || text.equals("N/A", ignoreCase = true)) {
+                return null
             }
-        }
 
-        return subjectList
-    }
+            // Extract numeric value from text (handles links and plain text)
+            val numericText = text.replace(Regex("[^0-9.]"), "")
 
-    private fun parseSubjectFacultyData(html: String): List<SubjectFaculty> {
-        val document = Jsoup.parse(html)
-        val facultyList = mutableListOf<SubjectFaculty>()
-
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row ->
-                val cells = row.select("td")
-                if (cells.size >= 4) {
-                    try {
-                        val subjectCode = cells[0].text().trim()
-                        val subjectName = cells[1].text().trim()
-                        val facultyName = cells[2].text().trim()
-                        val semester = cells[3].text().trim()
-
-                        if (subjectCode.isNotEmpty()) {
-                            facultyList.add(
-                                SubjectFaculty(subjectCode, subjectName, facultyName, semester)
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing faculty row: ${e.message}")
-                    }
-                }
+            if (numericText.isBlank()) {
+                return null
             }
-        }
 
-        return facultyList
+            numericText.toFloatOrNull()
+        } catch (e: Exception) {
+            Log.w("WebkioskScraper", "Error parsing percentage from: '$text'", e)
+            null
+        }
     }
 
-    private fun parseDisciplinaryActionData(html: String): List<DisciplinaryAction> {
-        val document = Jsoup.parse(html)
-        val actionList = mutableListOf<DisciplinaryAction>()
-
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row ->
-                val cells = row.select("td")
-                if (cells.size >= 4) {
-                    try {
-                        val date = cells[0].text().trim()
-                        val action = cells[1].text().trim()
-                        val reason = cells[2].text().trim()
-                        val status = cells[3].text().trim()
-
-                        actionList.add(
-                            DisciplinaryAction(date, action, reason, status)
-                        )
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing disciplinary action row: ${e.message}")
-                    }
-                }
+    // Helper method to parse percentage values (keeping original for compatibility)
+    private fun parsePercentage(text: String): Float? {
+        return try {
+            if (text.isBlank() || text.equals("NA", ignoreCase = true) || text.equals("N/A", ignoreCase = true)) {
+                null
+            } else {
+                // Remove % symbol if present and parse
+                val cleanText = text.replace("%", "").trim()
+                cleanText.toFloatOrNull()
             }
+        } catch (e: Exception) {
+            null
         }
-
-        return actionList
-    }
-
-    private fun parseSeatingPlanData(html: String): List<SeatingPlan> {
-        val document = Jsoup.parse(html)
-        val seatingPlanList = mutableListOf<SeatingPlan>()
-
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row ->
-                val cells = row.select("td")
-                if (cells.size >= 5) {
-                    try {
-                        val examDate = cells[0].text().trim()
-                        val examTime = cells[1].text().trim()
-                        val subject = cells[2].text().trim()
-                        val roomNo = cells[3].text().trim()
-                        val seatNo = cells[4].text().trim()
-
-                        seatingPlanList.add(
-                            SeatingPlan(examDate, examTime, subject, roomNo, seatNo)
-                        )
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing seating plan row: ${e.message}")
-                    }
-                }
-            }
-        }
-
-        return seatingPlanList
-    }
-
-    private fun parseMarksData(html: String): List<MarksRecord> {
-        val document = Jsoup.parse(html)
-        val marksList = mutableListOf<MarksRecord>()
-
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row ->
-                val cells = row.select("td")
-                if (cells.size >= 5) {
-                    try {
-                        val subject = cells[0].text().trim()
-                        val examType = cells[1].text().trim()
-                        val maxMarks = cells[2].text().trim().toIntOrNull() ?: 0
-                        val obtainedMarks = cells[3].text().trim().toIntOrNull() ?: 0
-                        val grade = cells[4].text().trim()
-
-                        if (subject.isNotEmpty()) {
-                            marksList.add(
-                                MarksRecord(subject, examType, maxMarks, obtainedMarks, grade)
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing marks row: ${e.message}")
-                    }
-                }
-            }
-        }
-
-        return marksList
-    }
-
-    private fun parseCGPAData(html: String): List<CGPARecord> {
-        val document = Jsoup.parse(html)
-        val cgpaList = mutableListOf<CGPARecord>()
-
-        document.select("table").forEach { table ->
-            table.select("tr").drop(1).forEach { row ->
-                val cells = row.select("td")
-                if (cells.size >= 4) {
-                    try {
-                        val semester = cells[0].text().trim()
-                        val sgpa = cells[1].text().trim().toFloatOrNull() ?: 0f
-                        val cgpa = cells[2].text().trim().toFloatOrNull() ?: 0f
-                        val totalCredits = cells[3].text().trim().toIntOrNull() ?: 0
-
-                        if (semester.isNotEmpty()) {
-                            cgpaList.add(
-                                CGPARecord(semester, sgpa, cgpa, totalCredits)
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w("WebkioskScraper", "Error parsing CGPA row: ${e.message}")
-                    }
-                }
-            }
-        }
-
-        return cgpaList
-    }
-
-    private fun getCurrentDateTime(): String {
-        val calendar = Calendar.getInstance()
-        return "${calendar.get(Calendar.DAY_OF_MONTH)}" +
-                "${calendar.get(Calendar.MONTH) + 1}" +
-                "${calendar.get(Calendar.YEAR)}" +
-                "${calendar.get(Calendar.HOUR_OF_DAY)}" +
-                "${calendar.get(Calendar.MINUTE)}" +
-                "${calendar.get(Calendar.SECOND)}"
     }
 }
